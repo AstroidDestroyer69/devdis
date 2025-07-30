@@ -1,72 +1,102 @@
-﻿#include <boost/asio.hpp>
+#include <boost/asio.hpp>
 #include <iostream>
-#include <vector>
-#include <iphlpapi.h>
 #include <thread>
-#include <chrono>
+#include <vector>
+#include <array>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "ws2_32.lib")
+#else
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#endif
 
-std::vector<boost::asio::ip::address_v4> get_broadcast_addresses() {
-    std::vector<boost::asio::ip::address_v4> result;
+std::vector<std::string> get_broadcast_addresses() {
+    std::vector<std::string> broadcasts;
 
-    ULONG size = 0;
-    GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &size);
+#ifdef _WIN32
+    ULONG buf_len = 15000;
+    std::vector<char> buffer(buf_len);
+    IP_ADAPTER_ADDRESSES* adapter_addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
 
-    std::vector<unsigned char> buffer(size);
-    IP_ADAPTER_ADDRESSES* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
-
-    if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &size) == NO_ERROR) {
-        for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
-            if (adapter->OperStatus != IfOperStatusUp) continue;
-
-            IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress;
-            while (unicast) {
-                SOCKADDR_IN* sa_in = reinterpret_cast<SOCKADDR_IN*>(unicast->Address.lpSockaddr);
-                DWORD ip = sa_in->sin_addr.S_un.S_addr;
-                DWORD mask = 0xFFFFFFFF << (32 - unicast->OnLinkPrefixLength);
-                DWORD broadcast = (ip & mask) | (~mask);
-
-                boost::asio::ip::address_v4 bcast_addr(htonl(broadcast));
-                result.push_back(bcast_addr);
-
-                unicast = unicast->Next;
-            }
-        }
+    DWORD ret = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapter_addresses, &buf_len);
+    if (ret != NO_ERROR) {
+        std::cerr << "GetAdaptersAddresses failed\n";
+        return broadcasts;
     }
 
-    return result;
+    for (IP_ADAPTER_ADDRESSES* adapter = adapter_addresses; adapter; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp || !adapter->FirstUnicastAddress)
+            continue;
+
+        for (IP_ADAPTER_UNICAST_ADDRESS* addr = adapter->FirstUnicastAddress; addr; addr = addr->Next) {
+            SOCKADDR_IN* sa_in = reinterpret_cast<SOCKADDR_IN*>(addr->Address.lpSockaddr);
+            DWORD prefix_len = addr->OnLinkPrefixLength;
+            ULONG ip = ntohl(sa_in->sin_addr.S_un.S_addr);
+
+            ULONG mask = 0xFFFFFFFF << (32 - prefix_len);
+            ULONG broadcast = ip | ~mask;
+
+            in_addr bcast_addr;
+            bcast_addr.S_un.S_addr = htonl(broadcast);
+            broadcasts.push_back(inet_ntoa(bcast_addr));
+        }
+    }
+#else
+    struct ifaddrs* ifaddr;
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return broadcasts;
+    }
+
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_BROADCAST) || !ifa->ifa_broadaddr)
+            continue;
+
+        if (ifa->ifa_broadaddr->sa_family == AF_INET) {
+            struct sockaddr_in* sa = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_broadaddr);
+            broadcasts.push_back(inet_ntoa(sa->sin_addr));
+        }
+    }
+    freeifaddrs(ifaddr);
+#endif
+
+    return broadcasts;
 }
 
 int main() {
     try {
         boost::asio::io_context io;
-
         boost::asio::ip::udp::socket socket(io);
         socket.open(boost::asio::ip::udp::v4());
-
-        // Enable broadcast
         socket.set_option(boost::asio::socket_base::broadcast(true));
 
-        std::string message = "Hello from client";
+        std::string message = " Hello from client!";
         unsigned short port = 9000;
 
-        std::vector<boost::asio::ip::address_v4> broadcast_addresses = get_broadcast_addresses();
-        int i = 0;
-        for (const auto& bcast : broadcast_addresses) {
-            while (i < 100) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-                boost::asio::ip::udp::endpoint endpoint(bcast, port);
+        auto broadcast_ips = get_broadcast_addresses();
+        if (broadcast_ips.empty()) {
+            std::cerr << " No broadcast addresses found.\n";
+            return 1;
+        }
+
+        for (const auto& ip : broadcast_ips) {
+            boost::asio::ip::udp::endpoint endpoint(
+                boost::asio::ip::make_address_v4(ip), port);
+
+            for (int i = 0; i < 3; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 socket.send_to(boost::asio::buffer(message), endpoint);
-                std::cout << "Sent to: " << bcast.to_string()<<" Request No=>" << i << " " << std::endl;
-                i++;
+                std::cout << " Sent to " << ip << " (attempt " << i + 1 << ")\n";
             }
         }
 
-        socket.close();
     }
-    catch (const std::exception& ex) {
-        std::cerr << "Error: " << ex.what() << "\n";
+    catch (std::exception& e) {
+        std::cerr << " Client error: " << e.what() << "\n";
     }
 
     return 0;
